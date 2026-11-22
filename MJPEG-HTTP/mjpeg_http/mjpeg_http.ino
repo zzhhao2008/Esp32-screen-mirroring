@@ -90,14 +90,14 @@ const uint16_t PUSH_PORT = 8080;
 #define DISPLAY_MODE_FIT  0
 #define DISPLAY_MODE_CROP 1
 #define DISPLAY_MODE_RAW  2
-#define DISPLAY_MODE      DISPLAY_MODE_RAW
+#define DISPLAY_MODE      DISPLAY_MODE_FIT
 
 // ---- 自动旋转:图像方向与屏幕方向不一致时,自动旋转 90°(顺时针)再适配
 //      竖屏手机画面投到横屏屏上会转成横向,画面利用率更高(FIT 时宽度能占满)
-#define AUTO_ROTATE 1   // 1=启用(推荐) 0=关闭
+#define AUTO_ROTATE 0   // 1=启用(推荐) 0=关闭
 
 // ---- SPI 时钟:40MHz 已验证稳定;想再提速可改 80*1000*1000(个别屏会花屏,回退即可)
-#define LCD_PCLK_HZ (40 * 1000 * 1000)
+#define LCD_PCLK_HZ (80 * 1000 * 1000)
 
 
 // ---------- FT6336U I2C 电容触摸配置(与 v3 完全相同) ----------
@@ -770,9 +770,17 @@ static int32_t bandBottom = 0;      // 当前行带已填充底部行
 void bandReset() { bandY = -1; bandW = 0; bandBottom = 0; }
 
 // 冲刷当前行带:整块一次 draw_bitmap
+// 注意:esp_lcd_panel_draw_bitmap 把缓冲按"区域宽度连续"解释,而 rowBand 的行距是 LCD_W,
+// 所以当 bandW != LCD_W 时必须逐行传输,否则整带画面错位(花屏)
 void bandFlush() {
   if (bandY < 0 || bandW == 0 || bandBottom <= bandY) { bandReset(); return; }
-  esp_lcd_panel_draw_bitmap(lcd_panel, 0, bandY, bandW, bandBottom, rowBand);
+  if (bandW == LCD_W) {
+    esp_lcd_panel_draw_bitmap(lcd_panel, 0, bandY, LCD_W, bandBottom, rowBand);
+  } else {
+    for (int32_t row = bandY; row < bandBottom; row++)
+      esp_lcd_panel_draw_bitmap(lcd_panel, 0, row, bandW, row + 1,
+                                rowBand + (uint32_t)(row - bandY) * LCD_W);
+  }
   bandReset();
 }
 
@@ -806,19 +814,26 @@ static bool drawBlockClipped(int32_t x, int32_t y, uint16_t w, uint16_t h,
 }
 
 // 非旋转路径:把裁剪后的块累积进行带(解码器按光栅顺序输出,同一 MCU 行天然连续)
+// 行带不变式(必须严格成立,否则会画出未写入的陈旧行 -> 阶梯错位花屏):
+//   行带只能从"行首块(x==0)"开启;只有 x 与游标连续、且行范围与带内已写区域
+//   无缝衔接(同一行续块 y+h<=bandBottom,或下一行恰好 y==bandBottom)才允许并入。
+//   因此 flush 区间 [bandY, bandBottom) 内每一行都保证已完整写入。
 static bool bandAccum(int16_t x, int16_t y, uint16_t w, uint16_t h,
                       const uint16_t* pixels, uint16_t stride) {
   if (!rowBand) {
     rowBand = (uint16_t *)heap_caps_malloc(LCD_W * BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
     if (!rowBand) return false;
   }
-  // 能接进当前行带:同一 16 行带内,且 x 与游标连续
-  if (!(bandY >= 0 && y >= bandY && y + h <= bandY + BAND_ROWS && x == bandW)) {
+  bool canJoin = (bandY >= 0 && x == bandW &&
+                  y >= bandY && y + h <= bandY + BAND_ROWS &&
+                  (y + h <= bandBottom || y == bandBottom));
+  if (!canJoin) {
     bandFlush();
-    bandY = ((int32_t)y / BAND_ROWS) * BAND_ROWS;
+    if (x != 0) return false;                      // 不从行首开始 -> 无法成带,直接绘制
+    bandY = y;
     bandW = 0;
-    bandBottom = bandY;
-    if (y < bandY || y + h > bandY + BAND_ROWS) return false;   // 异常对齐 → 直接绘制兜底
+    bandBottom = y;
+    if (y + h > bandY + BAND_ROWS) return false;   // 单块跨带 -> 直接绘制兜底
   }
   uint16_t *dst = rowBand + (uint32_t)(y - bandY) * LCD_W + x;
   for (uint16_t row = 0; row < h; row++)
@@ -1012,6 +1027,12 @@ void setup() {
 #endif
 
   xTaskCreatePinnedToCore(streamTask, "StreamTask", 16384, NULL, 2, NULL, 1);
+  // 打印当前编译配置(用于确认烧录的是最新版本固件)
+  Serial.printf("[BOOT] config: STREAM_MODE=%s DISPLAY_MODE=%s AUTO_ROTATE=%d PCLK=%u MHz\n",
+                STREAM_MODE == STREAM_MODE_PULL ? "PULL" : "PUSH",
+                DISPLAY_MODE == DISPLAY_MODE_FIT ? "FIT" :
+                (DISPLAY_MODE == DISPLAY_MODE_CROP ? "CROP" : "RAW"),
+                AUTO_ROTATE, LCD_PCLK_HZ / 1000000);
   Serial.println("[BOOT] Setup done, entering loop.");
 }
 
