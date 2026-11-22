@@ -198,7 +198,7 @@ SemaphoreHandle_t spiMutex;
 // 触摸方向映射：如果触摸方向不对，翻转下面两个值即可
 // 如果 X/Y 轴完全对不上（横向移动屏幕竖向变化），把 TOUCH_SWAP_XY 改为 true
 #define TOUCH_SWAP_XY   true
-#define TOUCH_INVERT_X  false
+#define TOUCH_INVERT_X  true
 #define TOUCH_INVERT_Y  false
 
 // 读取 FT6336U 第一个触点（原始坐标：X 0~239，Y 0~319）
@@ -467,7 +467,7 @@ bool lcd_init() {
   if (ret != ESP_OK) return false;
 
   // 与 devices.lua 相同的方向/反相配置
-  esp_lcd_panel_invert_color(lcd_panel, false);
+  esp_lcd_panel_invert_color(lcd_panel, true);
   esp_lcd_panel_swap_xy(lcd_panel, true);
   esp_lcd_panel_mirror(lcd_panel, false, true);
   esp_lcd_panel_disp_on_off(lcd_panel, true);
