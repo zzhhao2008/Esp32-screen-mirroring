@@ -41,13 +41,21 @@
 
 #define LCD_W 320
 #define LCD_H 240
-
+/* 3.2
 #define PIN_LCD_MOSI 17
 #define PIN_LCD_SCLK 18
 #define PIN_LCD_DC   15
 #define PIN_LCD_RST  7
 #define PIN_LCD_CS   6
-#define PIN_LCD_BL   8    // 高电平点亮
+#define PIN_LCD_BL   8    // 高电平点亮*/
+
+// 2.4NT
+#define PIN_LCD_MOSI 17
+#define PIN_LCD_SCLK 18
+#define PIN_LCD_DC   15
+#define PIN_LCD_RST  16
+#define PIN_LCD_CS   14
+#define PIN_LCD_BL   13    // 高电平点亮
 
 #define COLOR_BLACK 0x0000
 #define COLOR_WHITE 0xFFFF
@@ -73,6 +81,13 @@ const char*    PULL_PATH = "/mjpeg";        // 流路径(Screen Stream Mirroring
 
 // ---- PUSH 模式参数:本机监听端口,等别人 POST MJPEG 流过来 ----
 const uint16_t PUSH_PORT = 8080;
+
+// ---- 显示模式:发送端分辨率与屏幕(320x240)不一致时如何呈现 ----
+//  FIT  = 整幅缩放到屏幕内并居中(竖屏画面会上下留黑边,但看得到完整画面)
+//  CROP = 尽量放大铺满屏幕后居中裁剪(铺满无黑边,竖屏画面只显示中间部分)
+#define DISPLAY_MODE_FIT  0
+#define DISPLAY_MODE_CROP 1
+#define DISPLAY_MODE      DISPLAY_MODE_CROP
 
 // ---- 触摸上报(可选):非空则把触摸坐标以 GET 发到该地址(路径追加 ?x=&y=)
 //      例如 TOUCH_HOST = "192.168.1.100", TOUCH_PORT = 8080, TOUCH_PATH = "/touch"
@@ -274,7 +289,7 @@ bool readTouchScreen(uint16_t *sx, uint16_t *sy) {
 }
 
 // ---------- JPEG 接收缓冲与解码 ----------
-#define JPEG_BUFFER_SIZE 120 * 1024   // 单帧上限 120KB(PSRAM 充足,给高码率留余量)
+#define JPEG_BUFFER_SIZE 200 * 1024   // 单帧上限 200KB(实测 630x1422 手机原画约 120KB,留足余量)
 static uint8_t* jpegBuf = NULL;      // PSRAM
 
 // ---------- JPEG 流扫描:SOI(FF D8)/EOI(FF D9) 切帧 ----------
@@ -572,20 +587,41 @@ void decode_and_draw() {
 
   uint32_t t0 = micros();
 
-  // 按图像宽度自适应缩放(640 宽的帧自动 1/2,1280 宽自动 1/4)
   uint16_t w = 0, h = 0;
   TJpgDec.getJpgSize(&w, &h, jpegBuf, framePos);
   if (w == 0 || h == 0) {
     Serial.println("[DEC] getJpgSize failed, skip frame");
     return;
   }
+
+  // 按"宽高同时"自适应缩放(JPEG 硬件扫头只支持 1/2/4/8 整数缩放)
+  // 并计算绘制偏移:居中(FIT 可能留黑边,CROP 支持负偏移裁剪)
   uint8_t scale = 1;
-  if (w >= 1280) scale = 4;
-  else if (w >= 640) scale = 2;
+  int32_t ox = 0, oy = 0;
+#if DISPLAY_MODE == DISPLAY_MODE_FIT
+  // 整幅缩放到屏幕内:不断加倍 scale 直到宽高都装得下(最多 1/8)
+  while (scale < 8 && ((uint32_t)w > (uint32_t)LCD_W * scale || (uint32_t)h > (uint32_t)LCD_H * scale)) {
+    scale *= 2;
+  }
+  ox = ((int32_t)LCD_W - (int32_t)(w / scale)) / 2;
+  oy = ((int32_t)LCD_H - (int32_t)(h / scale)) / 2;
+#else
+  // CROP:选最小的 scale 让缩放后的宽高都 >= 屏幕(铺满),居中后超出部分被回调裁掉
+  if ((uint32_t)w <= LCD_W && (uint32_t)h <= LCD_H) {
+    scale = 1;   // 图比屏幕还小,原尺寸居中即可
+  } else {
+    for (uint8_t s = 1; s <= 8; s *= 2) {
+      scale = s;
+      if ((uint32_t)(w / s) >= LCD_W && (uint32_t)(h / s) >= LCD_H) break;
+    }
+  }
+  ox = ((int32_t)LCD_W - (int32_t)(w / scale)) / 2;
+  oy = ((int32_t)LCD_H - (int32_t)(h / scale)) / 2;
+#endif
   TJpgDec.setJpgScale(scale);
 
   xSemaphoreTake(spiMutex, portMAX_DELAY);
-  JRESULT r = TJpgDec.drawJpg(0, 0, jpegBuf, framePos);
+  JRESULT r = TJpgDec.drawJpg(ox, oy, jpegBuf, framePos);
   xSemaphoreGive(spiMutex);
 
   statFrames++;
@@ -594,8 +630,9 @@ void decode_and_draw() {
 
   // 每 60 帧打一条详细日志
   if (statFrames % 60 == 1) {
-    Serial.printf("[DEC] #%lu %ux%u scale%u %lu bytes result=%s decode+draw=%lu us stack HW:%u\n",
+    Serial.printf("[DEC] #%lu %ux%u scale1/%u draw@(%d,%d) %lu bytes result=%s decode+draw=%lu us stack HW:%u\n",
                   (unsigned long)statFrames, w, h, scale,
+                  (int)ox, (int)oy,
                   (unsigned long)framePos, jresult_str(r), (unsigned long)dt,
                   (unsigned)uxTaskGetStackHighWaterMark(NULL));
   }
@@ -629,12 +666,28 @@ const char* jresult_str(JRESULT r) {
   }
 }
 
-// ---------- JPEG 解码输出回调(与 v3 相同) ----------
+// ---------- JPEG 解码输出回调(支持负偏移:任意位置裁剪到屏幕范围) ----------
 static uint16_t *blockBuf = NULL;
 #define BLOCK_BUF_PX  1024
 
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  if (y >= LCD_H || x >= LCD_W) return 0;
+  // 裁掉屏幕左侧/上侧之外的部分(负偏移),bitmap 按原始行距 w 前移
+  if (x < 0) {
+    int16_t cut = -x;
+    if (cut >= (int16_t)w) return 1;              // 整块在屏幕外,跳过但继续解码
+    bitmap += cut;
+    w -= cut;
+    x = 0;
+  }
+  if (y < 0) {
+    int16_t cut = -y;
+    if (cut >= (int16_t)h) return 1;
+    bitmap += (int32_t)cut * w;
+    h -= cut;
+    y = 0;
+  }
+  // 裁掉屏幕右侧/下侧之外的部分
+  if (x >= LCD_W || y >= LCD_H) return 1;
   if (x + w > LCD_W) w = LCD_W - x;
   if (y + h > LCD_H) h = LCD_H - y;
   if (w == 0 || h == 0) return 1;

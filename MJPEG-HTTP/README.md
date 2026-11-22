@@ -30,8 +30,10 @@ ESP32 作为 **HTTP 客户端**,持续 GET 拉取 MJPEG 流。适合配合"发�
 
 - **安卓 App「Screen Stream Mirroring」**(免 root):
   1. 手机安装并启动 App,选择"屏幕直播/Start Broadcasting",记下提示的地址(默认端口 8080);
-  2. 固件里把 `PULL_HOST` 改成手机 IP(`PULL_PORT=8080`、`PULL_PATH="/"` 不用动);
-  3. 编译烧录即可,手机画面实时显示在 ESP32 屏幕上。
+  2. 固件里把 `PULL_HOST` 改成手机 IP(`PULL_PORT=8080` 不用动);
+  3. `PULL_PATH` 按版本填 **`/mjpeg` 或 `/stream`**(两者在不同 App 版本中都出现过;
+     根路径 `/` 是 App 的网页预览页,不是流——连错时串口会打 text/html 警告);
+  4. 编译烧录即可,手机画面实时显示在 ESP32 屏幕上。
 - **ffmpeg 作为服务端**(电脑推给 ESP32 拉):
   ```
   ffmpeg -f gdigrab -framerate 15 -i desktop -vf scale=320:240 -q:v 5 \
@@ -78,8 +80,14 @@ EOI(`FF D9`)标记切帧,因此以下封装全部直接兼容:
 - `multipart/x-mixed-replace`(Screen Stream Mirroring、绝大多数 IP 摄像头)
 - `Transfer-Encoding: chunked`(ffmpeg POST 推流默认)
 
-固件还会按帧宽度自适应缩放:推 640 宽的帧自动 1/2 缩放,1280 宽自动 1/4,
-所以发送端不必严格缩到 320x240,但缩到目标分辨率能省带宽、帧率更高。
+固件还会按**宽高同时**自适应缩放(JPEG 只支持 1/2/4/8 整数缩放),并支持两种显示
+模式(配置区 `DISPLAY_MODE`):
+
+- **FIT(默认)**:整幅缩放进 320x240 并居中,竖屏画面上下留黑边但内容完整;
+- **CROP**:尽量放大铺满屏幕后居中裁剪,无黑边但只显示画面中间部分。
+
+绘制回调支持负偏移裁剪,任意分辨率(横屏/竖屏/超宽)都能正确落到屏幕上。
+单帧缓冲 200KB,超限会丢帧重新同步(`[STAT] dropped` 计数)。
 
 ## 触摸
 
@@ -101,5 +109,5 @@ FT6336U 触摸照常工作,串口会打印坐标。MJPEG 模式没有专用控�
 | PULL 一直 connect failed | 检查 `PULL_HOST` IP 是否正确、发送端是否已启动、防火墙 |
 | 连上了但没画面 | 看串口响应头,确认 Content-Type 是 image/jpeg 或 multipart/x-mixed-replace |
 | 画面不流畅 | 发送端把分辨率缩到 320x240、降低 JPEG 质量/帧率;检查 WiFi 信号(RSSI 日志) |
-| `[STAT] dropped` 增长 | 单帧超过 120KB 缓冲上限,降低发送端质量/分辨率 |
+| `[STAT] dropped` 增长 | 单帧超过 200KB 缓冲上限,降低发送端质量/分辨率 |
 | 颜色不对 | 与 v3 相同的 swap/invert 配置已保留,一般不会出现;新屏幕需调 `lcd_init()` |
