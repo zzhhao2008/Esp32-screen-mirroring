@@ -58,8 +58,8 @@ static esp_lcd_panel_io_handle_t lcd_io = NULL;
 static esp_lcd_panel_handle_t lcd_panel = NULL;
 
 // ================= 用户配置区 =================
-const char* ssid     = "1701";          // WiFi 名称(与 v3 相同)
-const char* password = "13964398089";   // WiFi 密码
+const char* ssid     = "P70PP";          // WiFi 名称(与 v3 相同)
+const char* password = "12345678.";   // WiFi 密码
 
 // 工作模式选择
 #define STREAM_MODE_PULL  0
@@ -67,9 +67,9 @@ const char* password = "13964398089";   // WiFi 密码
 #define STREAM_MODE       STREAM_MODE_PULL   // 改成 STREAM_MODE_PUSH 即切换为推流接收模式
 
 // ---- PULL 模式参数:要去拉流的 MJPEG 地址 ----
-const char*    PULL_HOST = "192.168.1.100";  // 发送端 IP(例如开了 Screen Stream Mirroring 的手机)
+const char*    PULL_HOST = "192.168.43.1";  // 发送端 IP(例如开了 Screen Stream Mirroring 的手机)
 const uint16_t PULL_PORT = 8080;             // 发送端端口(Screen Stream Mirroring 默认 8080)
-const char*    PULL_PATH = "/";              // 流路径(Screen Stream Mirroring 就是 "/")
+const char*    PULL_PATH = "/mjpeg";        // 流路径(Screen Stream Mirroring 为 "/mjpeg";根路径 "/" 是它的网页预览页)
 
 // ---- PUSH 模式参数:本机监听端口,等别人 POST MJPEG 流过来 ----
 const uint16_t PUSH_PORT = 8080;
@@ -449,6 +449,12 @@ void streamTask(void *pvParameters) {
     chunked_reset();
     chunkedEnabled = (hl.indexOf("transfer-encoding") >= 0 && hl.indexOf("chunked") >= 0);
     if (chunkedEnabled) Serial.println("[STREAM] Transfer-Encoding: chunked -> de-chunk enabled");
+
+    // 友好提示:连到的是 HTML 网页而不是 MJPEG 流
+    if (hl.indexOf("content-type: text/html") >= 0) {
+      Serial.println("[STREAM] WARNING: got text/html (a web page, not the stream).");
+      Serial.println("[STREAM] Try PULL_PATH = \"/stream\" (Screen Stream Mirroring) or the direct stream URL.");
+    }
 
     // 持续读 body,扫描 JPEG 帧并解码
     while (client.connected()) {
