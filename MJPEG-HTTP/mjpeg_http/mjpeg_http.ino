@@ -85,9 +85,32 @@ const uint16_t PUSH_PORT = 8080;
 // ---- 显示模式:发送端分辨率与屏幕(320x240)不一致时如何呈现 ----
 //  FIT  = 整幅缩放到屏幕内并居中(竖屏画面会上下留黑边,但看得到完整画面)
 //  CROP = 尽量放大铺满屏幕后居中裁剪(铺满无黑边,竖屏画面只显示中间部分)
+//  RAW  = 直出模式:缩放/裁剪/旋转全部由发送端完成(直接推 LCD 尺寸如 320x240 的帧),
+//         ESP32 原样显示,不做任何缩放/旋转/偏移,解码绘制开销最小、延迟最低
 #define DISPLAY_MODE_FIT  0
 #define DISPLAY_MODE_CROP 1
-#define DISPLAY_MODE      DISPLAY_MODE_CROP
+#define DISPLAY_MODE_RAW  2
+#define DISPLAY_MODE      DISPLAY_MODE_RAW
+
+// ---- 自动旋转:图像方向与屏幕方向不一致时,自动旋转 90°(顺时针)再适配
+//      竖屏手机画面投到横屏屏上会转成横向,画面利用率更高(FIT 时宽度能占满)
+#define AUTO_ROTATE 1   // 1=启用(推荐) 0=关闭
+
+// ---- SPI 时钟:40MHz 已验证稳定;想再提速可改 80*1000*1000(个别屏会花屏,回退即可)
+#define LCD_PCLK_HZ (40 * 1000 * 1000)
+
+
+// ---------- FT6336U I2C 电容触摸配置(与 v3 完全相同) ----------
+#define TOUCH_SDA  11
+#define TOUCH_SCL  9
+#define TOUCH_RST  10
+#define TOUCH_INT  12
+//#define TOUCH_INT  13  //非触摸的背光驱动与此处冲突
+#define FT6336_ADDR  0x38
+
+#define TOUCH_SWAP_XY   true
+#define TOUCH_INVERT_X  false
+#define TOUCH_INVERT_Y  false
 
 // ---- 触摸上报(可选):非空则把触摸坐标以 GET 发到该地址(路径追加 ?x=&y=)
 //      例如 TOUCH_HOST = "192.168.1.100", TOUCH_PORT = 8080, TOUCH_PATH = "/touch"
@@ -247,16 +270,6 @@ void drawText(int16_t x, int16_t y, const char *s, uint16_t fg, uint16_t bg, uin
 
 SemaphoreHandle_t spiMutex;
 
-// ---------- FT6336U I2C 电容触摸配置(与 v3 完全相同) ----------
-#define TOUCH_SDA  11
-#define TOUCH_SCL  9
-#define TOUCH_RST  10
-#define TOUCH_INT  13
-#define FT6336_ADDR  0x38
-
-#define TOUCH_SWAP_XY   true
-#define TOUCH_INVERT_X  false
-#define TOUCH_INVERT_Y  false
 
 bool ft6336_read(uint16_t *rawX, uint16_t *rawY) {
   uint8_t buf[5];
@@ -289,8 +302,14 @@ bool readTouchScreen(uint16_t *sx, uint16_t *sy) {
 }
 
 // ---------- JPEG 接收缓冲与解码 ----------
-#define JPEG_BUFFER_SIZE 200 * 1024   // 单帧上限 200KB(实测 630x1422 手机原画约 120KB,留足余量)
-static uint8_t* jpegBuf = NULL;      // PSRAM
+// 乒乓双缓冲(PSRAM 充足,各 1MB):解码 drawBuf 的同时,网络数据继续写入 scanBuf,
+// 接收不再被解码阻塞,延迟更低;单帧超过 1MB 才会丢帧重新同步
+#define JPEG_BUFFER_SIZE 1024 * 1024
+static uint8_t* jpegBufA = NULL;     // PSRAM 乒乓缓冲 A
+static uint8_t* jpegBufB = NULL;     // PSRAM 乒乓缓冲 B
+static uint8_t* scanBuf = NULL;      // 当前接收写入的缓冲
+static uint8_t* drawBuf = NULL;      // 最近一帧完整数据所在缓冲
+static uint32_t drawLen = 0;         // 最近一帧长度
 
 // ---------- JPEG 流扫描:SOI(FF D8)/EOI(FF D9) 切帧 ----------
 // 不依赖 boundary / Content-Length,raw MJPEG / multipart / chunked 通吃
@@ -299,22 +318,31 @@ static bool     scanLastFF = false;    // IN_FRAME 状态下上一个字节是�
 static uint32_t framePos   = 0;
 static bool     inFrame    = false;
 static uint32_t droppedFrames = 0;   // 因超过缓冲上限被丢弃的帧数
+static uint32_t staleSkipped = 0;    // 因积压(延迟大)被跳过、只解最新帧的帧数
 
-// 返回 true 表示收到一帧完整 JPEG(数据在 jpegBuf,长度 framePos)
+// ---------- 旋转 / 行带批量绘制状态(tft_output 及其辅助函数使用) ----------
+static bool    rotEnabled = false;              // 本帧是否旋转 90°(顺时针)
+static int32_t rotOffX = 0, rotOffY = 0;        // 旋转后坐标系的目标偏移
+static int32_t rotSrcH = 0;                     // 缩放后源图高度(旋转坐标映射用)
+void bandReset();
+void bandFlush();
+
+// 返回 true 表示收到一帧完整 JPEG(数据已切换到 drawBuf,长度 drawLen;
+// scanBuf 已切到另一块乒乓缓冲,可继续接收下一帧)
 bool scanner_feed(const uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; i++) {
     uint8_t b = data[i];
     if (!inFrame) {
       // 等待 SOI: FF D8
       if (scanPrev == 0xFF && b == 0xD8) {
-        jpegBuf[0] = 0xFF; jpegBuf[1] = 0xD8;
+        scanBuf[0] = 0xFF; scanBuf[1] = 0xD8;
         framePos = 2; inFrame = true; scanLastFF = false; scanPrev = 0;
       } else {
         scanPrev = b;
       }
     } else {
       if (framePos < JPEG_BUFFER_SIZE) {
-        jpegBuf[framePos++] = b;
+        scanBuf[framePos++] = b;
       } else {
         // 帧太大超过缓冲,丢弃本帧并重新同步
         inFrame = false; scanPrev = 0; scanLastFF = false;
@@ -323,7 +351,11 @@ bool scanner_feed(const uint8_t* data, size_t len) {
       }
       if (scanLastFF && b == 0xD9) {
         // EOI 到达,完整一帧(FF D9 已写入缓冲)
+        // 乒乓切换:该缓冲交给解码,后续数据写入另一块(解码期间接收不停顿)
         inFrame = false; scanPrev = 0;
+        drawBuf = scanBuf;
+        drawLen = framePos;
+        scanBuf = (scanBuf == jpegBufA) ? jpegBufB : jpegBufA;
         return true;
       }
       scanLastFF = (b == 0xFF);
@@ -345,7 +377,9 @@ void chunked_reset() {
 }
 
 // 把 chunked 解码后的数据喂给 JPEG 扫描器
-void chunked_feed(const uint8_t* data, size_t len) {
+// 返回 true 表示本次喂入期间有完整帧到达(是否解码由外层根据积压情况决定)
+bool chunked_feed(const uint8_t* data, size_t len) {
+  bool gotFrame = false;
   for (size_t i = 0; i < len; i++) {
     uint8_t b = data[i];
     switch (chunkState) {
@@ -368,7 +402,7 @@ void chunked_feed(const uint8_t* data, size_t len) {
       case CHUNK_DATA: {
         size_t n = len - i;
         if (n > chunkRemain) n = chunkRemain;
-        if (scanner_feed(data + i, n)) decode_and_draw();
+        if (scanner_feed(data + i, n)) gotFrame = true;
         i += n - 1;
         chunkRemain -= n;
         if (chunkRemain == 0) chunkState = CHUNK_CRLF;
@@ -384,15 +418,17 @@ void chunked_feed(const uint8_t* data, size_t len) {
         break;
     }
   }
+  return gotFrame;
 }
 
-// 统一入口:原始字节流 -> (按需去 chunked) -> JPEG 扫描 -> 解码绘制
-void body_feed(const uint8_t* data, size_t len) {
+// 统一入口:原始字节流 -> (按需去 chunked) -> JPEG 扫描
+// 返回 true 表示有完整帧到达(drawBuf/drawLen 即该帧;是否解码由外层决定)
+// 注意:解码必须在本函数返回 true 的"当下"进行——继续喂入会覆盖缓冲
+bool body_feed(const uint8_t* data, size_t len) {
   if (!chunkedEnabled) {
-    if (scanner_feed(data, len)) decode_and_draw();
-  } else {
-    chunked_feed(data, len);
+    return scanner_feed(data, len);
   }
+  return chunked_feed(data, len);
 }
 
 // ---------- 触摸上报(可选) ----------
@@ -418,7 +454,7 @@ void reportTouch(uint16_t x, uint16_t y) {
 
 // ---- PULL:HTTP 客户端,持续拉取 MJPEG 流 ----
 void streamTask(void *pvParameters) {
-  static uint8_t rbuf[2048];
+  static uint8_t rbuf[8192];
   while (1) {
     if (WiFi.status() != WL_CONNECTED) { vTaskDelay(500 / portTICK_PERIOD_MS); continue; }
 
@@ -477,7 +513,14 @@ void streamTask(void *pvParameters) {
       if (avail <= 0) { vTaskDelay(1); continue; }
       int n = client.read(rbuf, (avail > (int)sizeof(rbuf)) ? (int)sizeof(rbuf) : avail);
       if (n <= 0) continue;
-      body_feed(rbuf, (size_t)n);
+      if (body_feed(rbuf, (size_t)n)) {
+        // 只解最新帧:积压超过一帧就跳过,尽快排空旧数据,把延迟压到约一帧
+        if (client.available() > (int)framePos) {
+          staleSkipped++;
+        } else {
+          decode_and_draw();
+        }
+      }
     }
 
     Serial.println("[STREAM] server closed connection, reconnecting...");
@@ -500,7 +543,7 @@ void pushSendSimple(WiFiClient &c, int code, const char* text) {
 }
 
 void streamTask(void *pvParameters) {
-  static uint8_t rbuf[2048];
+  static uint8_t rbuf[8192];
   pushServer.begin();
   Serial.printf("[PUSH] HTTP server listening on port %u (POST/PUT MJPEG stream here)\n", PUSH_PORT);
 
@@ -564,7 +607,14 @@ void streamTask(void *pvParameters) {
       if (avail <= 0) { vTaskDelay(1); continue; }
       int n = client.read(rbuf, (avail > (int)sizeof(rbuf)) ? (int)sizeof(rbuf) : avail);
       if (n <= 0) continue;
-      body_feed(rbuf, (size_t)n);
+      if (body_feed(rbuf, (size_t)n)) {
+        // 只解最新帧:积压超过一帧就跳过,尽快排空旧数据,把延迟压到约一帧
+        if (client.available() > (int)framePos) {
+          staleSkipped++;
+        } else {
+          decode_and_draw();
+        }
+      }
     }
 
     // 客户端推完断开,补一个最终响应(可能发不出去,尽力而为)
@@ -583,45 +633,77 @@ static uint32_t statWindowFrames = 0;
 static uint32_t statWindowStart = 0;
 
 void decode_and_draw() {
-  if (framePos < 4) return;
+  if (drawBuf == NULL || drawLen < 4) return;
 
   uint32_t t0 = micros();
 
   uint16_t w = 0, h = 0;
-  TJpgDec.getJpgSize(&w, &h, jpegBuf, framePos);
+  TJpgDec.getJpgSize(&w, &h, drawBuf, drawLen);
   if (w == 0 || h == 0) {
     Serial.println("[DEC] getJpgSize failed, skip frame");
     return;
   }
 
-  // 按"宽高同时"自适应缩放(JPEG 硬件扫头只支持 1/2/4/8 整数缩放)
-  // 并计算绘制偏移:居中(FIT 可能留黑边,CROP 支持负偏移裁剪)
+  bool rotate = false;
   uint8_t scale = 1;
-  int32_t ox = 0, oy = 0;
+  int32_t oxR = 0, oyR = 0;
+
+#if DISPLAY_MODE == DISPLAY_MODE_RAW
+  // RAW 直出:发送端已完成缩放/裁剪/旋转(应为 LCD 尺寸帧),原样显示,零处理
+  if ((w != LCD_W || h != LCD_H) && statFrames % 60 == 0) {
+    Serial.printf("[DEC] WARNING: RAW mode expects %dx%d frames, got %ux%u (resize on sender)\n",
+                  LCD_W, LCD_H, w, h);
+  }
+#else
+  // 自动旋转:图像方向与屏幕方向不一致时旋转 90°(顺时针)
+  //   竖屏手机画面(高>宽)投到横屏屏(宽>高)上 -> 转成横向,宽边能占满屏幕
+#if AUTO_ROTATE
+  rotate = ((w > h) != (LCD_W > LCD_H));
+#endif
+
+  // 旋转后的等效图像尺寸(缩放前)
+  uint32_t iw = rotate ? h : w;
+  uint32_t ih = rotate ? w : h;
+
+  // 按"宽高同时"自适应缩放(JPEG 解码只支持 1/2/4/8 整数缩放)
 #if DISPLAY_MODE == DISPLAY_MODE_FIT
   // 整幅缩放到屏幕内:不断加倍 scale 直到宽高都装得下(最多 1/8)
-  while (scale < 8 && ((uint32_t)w > (uint32_t)LCD_W * scale || (uint32_t)h > (uint32_t)LCD_H * scale)) {
+  while (scale < 8 && (iw > (uint32_t)LCD_W * scale || ih > (uint32_t)LCD_H * scale)) {
     scale *= 2;
   }
-  ox = ((int32_t)LCD_W - (int32_t)(w / scale)) / 2;
-  oy = ((int32_t)LCD_H - (int32_t)(h / scale)) / 2;
 #else
   // CROP:选最小的 scale 让缩放后的宽高都 >= 屏幕(铺满),居中后超出部分被回调裁掉
-  if ((uint32_t)w <= LCD_W && (uint32_t)h <= LCD_H) {
+  if (iw <= LCD_W && ih <= LCD_H) {
     scale = 1;   // 图比屏幕还小,原尺寸居中即可
   } else {
     for (uint8_t s = 1; s <= 8; s *= 2) {
       scale = s;
-      if ((uint32_t)(w / s) >= LCD_W && (uint32_t)(h / s) >= LCD_H) break;
+      if (iw / s >= LCD_W && ih / s >= LCD_H) break;
     }
   }
-  ox = ((int32_t)LCD_W - (int32_t)(w / scale)) / 2;
-  oy = ((int32_t)LCD_H - (int32_t)(h / scale)) / 2;
 #endif
+
+  // 居中偏移(按旋转后的坐标系计算)
+  oxR = ((int32_t)LCD_W - (int32_t)(iw / scale)) / 2;
+  oyR = ((int32_t)LCD_H - (int32_t)(ih / scale)) / 2;
+#endif
+
   TJpgDec.setJpgScale(scale);
+  rotEnabled = rotate;
+  rotSrcH    = (int32_t)(h / scale);   // 缩放后源图高(旋转映射用)
+  rotOffX    = oxR;
+  rotOffY    = oyR;
 
   xSemaphoreTake(spiMutex, portMAX_DELAY);
-  JRESULT r = TJpgDec.drawJpg(ox, oy, jpegBuf, framePos);
+  bandReset();
+  JRESULT r;
+  if (rotate) {
+    // 旋转模式:drawJpg 不加偏移,目标偏移在回调里做坐标映射
+    r = TJpgDec.drawJpg(0, 0, drawBuf, drawLen);
+  } else {
+    r = TJpgDec.drawJpg(oxR, oyR, drawBuf, drawLen);
+  }
+  bandFlush();   // 冲刷行带批量绘制缓冲(仍持有 spiMutex)
   xSemaphoreGive(spiMutex);
 
   statFrames++;
@@ -630,10 +712,10 @@ void decode_and_draw() {
 
   // 每 60 帧打一条详细日志
   if (statFrames % 60 == 1) {
-    Serial.printf("[DEC] #%lu %ux%u scale1/%u draw@(%d,%d) %lu bytes result=%s decode+draw=%lu us stack HW:%u\n",
-                  (unsigned long)statFrames, w, h, scale,
-                  (int)ox, (int)oy,
-                  (unsigned long)framePos, jresult_str(r), (unsigned long)dt,
+    Serial.printf("[DEC] #%lu %ux%u%s scale1/%u off(%d,%d) %lu bytes result=%s decode+draw=%lu us stack HW:%u\n",
+                  (unsigned long)statFrames, w, h, rotate ? " ROT90" : "", scale,
+                  (int)oxR, (int)oyR,
+                  (unsigned long)drawLen, jresult_str(r), (unsigned long)dt,
                   (unsigned)uxTaskGetStackHighWaterMark(NULL));
   }
 
@@ -642,8 +724,9 @@ void decode_and_draw() {
   if (statWindowStart == 0) statWindowStart = now;
   if (now - statWindowStart >= 5000) {
     float fps = statWindowFrames * 1000.0f / (now - statWindowStart);
-    Serial.printf("[STAT] %.1f fps | total=%lu dropped=%lu | heap=%u KB psram=%u KB\n",
-                  fps, (unsigned long)statFrames, (unsigned long)droppedFrames,
+    Serial.printf("[STAT] %.1f fps | total=%lu stale-skip=%lu dropped=%lu | heap=%u KB psram=%u KB\n",
+                  fps, (unsigned long)statFrames, (unsigned long)staleSkipped,
+                  (unsigned long)droppedFrames,
                   ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
     statWindowStart = now;
     statWindowFrames = 0;
@@ -666,45 +749,117 @@ const char* jresult_str(JRESULT r) {
   }
 }
 
-// ---------- JPEG 解码输出回调(支持负偏移:任意位置裁剪到屏幕范围) ----------
-static uint16_t *blockBuf = NULL;
+// ---------- JPEG 解码输出回调 ----------
+// 三条路径:
+//   1. 非旋转 + 行带批量绘制:MCU 块累积进整行带缓冲,一行带一次 SPI 传输
+//      (全分辨率帧从 ~3500 次 draw 降到 ~90 次,是绘制环节最大的提速点)
+//   2. 旋转 90°(AUTO_ROTATE):块级像素转置后绘制(转置块 ≤16x16)
+//   3. 兜底:任意情况下裁剪后直接绘制
+// 注意:本回调及行带函数都在 decode_and_draw 持有 spiMutex 的上下文中执行,
+//       内部不要再取互斥量(非递归锁会死锁)。
+static uint16_t *blockBuf = NULL;   // 块搬运缓冲(DMA)
+static uint16_t *rowBand  = NULL;   // 行带缓冲:LCD_W x 32 像素(内部 SRAM DMA,~20KB)
+static uint16_t *rotBuf   = NULL;   // 转置缓冲(DMA)
 #define BLOCK_BUF_PX  1024
+#define BAND_ROWS     32
+
+static int32_t bandY = -1;          // 当前行带起始行(-1 = 无)
+static int32_t bandW = 0;           // 当前行带已填充宽度
+static int32_t bandBottom = 0;      // 当前行带已填充底部行
+
+void bandReset() { bandY = -1; bandW = 0; bandBottom = 0; }
+
+// 冲刷当前行带:整块一次 draw_bitmap
+void bandFlush() {
+  if (bandY < 0 || bandW == 0 || bandBottom <= bandY) { bandReset(); return; }
+  esp_lcd_panel_draw_bitmap(lcd_panel, 0, bandY, bandW, bandBottom, rowBand);
+  bandReset();
+}
+
+// 裁剪到屏幕范围(支持负偏移/越界,步长 stride 与宽度 w 解耦)后绘制
+static bool drawBlockClipped(int32_t x, int32_t y, uint16_t w, uint16_t h,
+                             const uint16_t* pixels, uint16_t stride) {
+  if (x < 0) { int32_t cut = -x; if (cut >= (int32_t)w) return true; pixels += cut; w -= cut; x = 0; }
+  if (y < 0) { int32_t cut = -y; if (cut >= (int32_t)h) return true; pixels += (int32_t)cut * stride; h -= cut; y = 0; }
+  if (x >= LCD_W || y >= LCD_H) return true;
+  if (x + w > LCD_W) w = LCD_W - x;
+  if (y + h > LCD_H) h = LCD_H - y;
+  if (w == 0 || h == 0) return true;
+
+  if (!blockBuf) {
+    blockBuf = (uint16_t *)heap_caps_malloc(BLOCK_BUF_PX * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!blockBuf) { Serial.println("[E] blockBuf alloc failed"); return false; }
+  }
+  if ((uint32_t)w * h <= BLOCK_BUF_PX) {
+    // 小块:先整块拷进 DMA 缓冲(按 stride 取行),一次 SPI 传输
+    for (uint16_t row = 0; row < h; row++)
+      memcpy(blockBuf + (uint32_t)row * w, pixels + (uint32_t)row * stride, (uint32_t)w * 2);
+    esp_lcd_panel_draw_bitmap(lcd_panel, x, y, x + w, y + h, blockBuf);
+  } else {
+    // 超大块兜底:逐行传输
+    for (uint16_t row = 0; row < h; row++) {
+      memcpy(blockBuf, pixels + (uint32_t)row * stride, (uint32_t)w * 2);
+      esp_lcd_panel_draw_bitmap(lcd_panel, x, y + row, x + w, y + row + 1, blockBuf);
+    }
+  }
+  return true;
+}
+
+// 非旋转路径:把裁剪后的块累积进行带(解码器按光栅顺序输出,同一 MCU 行天然连续)
+static bool bandAccum(int16_t x, int16_t y, uint16_t w, uint16_t h,
+                      const uint16_t* pixels, uint16_t stride) {
+  if (!rowBand) {
+    rowBand = (uint16_t *)heap_caps_malloc(LCD_W * BAND_ROWS * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!rowBand) return false;
+  }
+  // 能接进当前行带:同一 16 行带内,且 x 与游标连续
+  if (!(bandY >= 0 && y >= bandY && y + h <= bandY + BAND_ROWS && x == bandW)) {
+    bandFlush();
+    bandY = ((int32_t)y / BAND_ROWS) * BAND_ROWS;
+    bandW = 0;
+    bandBottom = bandY;
+    if (y < bandY || y + h > bandY + BAND_ROWS) return false;   // 异常对齐 → 直接绘制兜底
+  }
+  uint16_t *dst = rowBand + (uint32_t)(y - bandY) * LCD_W + x;
+  for (uint16_t row = 0; row < h; row++)
+    memcpy(dst + (uint32_t)row * LCD_W, pixels + (uint32_t)row * stride, (uint32_t)w * 2);
+  if (x + w > bandW) bandW = x + w;
+  if (y + h > bandBottom) bandBottom = y + h;
+  return true;
+}
+
+// 旋转 90°(顺时针)路径:源块 (x,y,w,h) -> 目标块宽高互换 + 像素转置
+// 映射:dest(i列,j行) = src(第 h-1-i 行, 第 j 列);dest_x = rotOffX + rotSrcH - (y+h)
+static bool tft_output_rot(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
+  int32_t dx = rotOffX + rotSrcH - (int32_t)y - (int32_t)h;
+  int32_t dy = rotOffY + (int32_t)x;
+  uint16_t dw = h, dh = w;   // 目标块:dw 列 x dh 行
+
+  if (!rotBuf) {
+    rotBuf = (uint16_t *)heap_caps_malloc(BLOCK_BUF_PX * sizeof(uint16_t), MALLOC_CAP_DMA);
+    if (!rotBuf) { Serial.println("[E] rotBuf alloc failed"); return false; }
+  }
+  for (uint16_t j = 0; j < dh; j++)
+    for (uint16_t i = 0; i < dw; i++)
+      rotBuf[(uint32_t)j * dw + i] = bitmap[(uint32_t)(h - 1 - i) * w + j];
+  return drawBlockClipped(dx, dy, dw, dh, rotBuf, dw);
+}
 
 bool tft_output(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* bitmap) {
-  // 裁掉屏幕左侧/上侧之外的部分(负偏移),bitmap 按原始行距 w 前移
-  if (x < 0) {
-    int16_t cut = -x;
-    if (cut >= (int16_t)w) return 1;              // 整块在屏幕外,跳过但继续解码
-    bitmap += cut;
-    w -= cut;
-    x = 0;
-  }
-  if (y < 0) {
-    int16_t cut = -y;
-    if (cut >= (int16_t)h) return 1;
-    bitmap += (int32_t)cut * w;
-    h -= cut;
-    y = 0;
-  }
-  // 裁掉屏幕右侧/下侧之外的部分
+  if (rotEnabled) return tft_output_rot(x, y, w, h, bitmap);
+
+  // 非旋转:先裁剪到屏幕范围(负偏移支持,步长 stride 与 w 解耦),再尽量累积行带
+  const uint16_t* pixels = bitmap;
+  uint16_t stride = w;
+  if (x < 0) { int32_t cut = -x; if (cut >= (int16_t)w) return 1; pixels += cut; w -= cut; x = 0; }
+  if (y < 0) { int32_t cut = -y; if (cut >= (int16_t)h) return 1; pixels += (int32_t)cut * stride; h -= cut; y = 0; }
   if (x >= LCD_W || y >= LCD_H) return 1;
   if (x + w > LCD_W) w = LCD_W - x;
   if (y + h > LCD_H) h = LCD_H - y;
   if (w == 0 || h == 0) return 1;
 
-  if (!blockBuf) {
-    blockBuf = (uint16_t *)heap_caps_malloc(BLOCK_BUF_PX * sizeof(uint16_t), MALLOC_CAP_DMA);
-    if (!blockBuf) { Serial.println("[E] blockBuf alloc failed"); return 0; }
-  }
-
-  if ((uint32_t)w * h <= BLOCK_BUF_PX) {
-    memcpy(blockBuf, bitmap, (uint32_t)w * h * 2);
-    esp_lcd_panel_draw_bitmap(lcd_panel, x, y, x + w, y + h, blockBuf);
-  } else {
-    for (int row = 0; row < h; row++) {
-      memcpy(blockBuf, bitmap + (uint32_t)row * w, (uint32_t)w * 2);
-      esp_lcd_panel_draw_bitmap(lcd_panel, x, y + row, x + w, y + row + 1, blockBuf);
-    }
+  if (!bandAccum(x, y, w, h, pixels, stride)) {
+    if (!drawBlockClipped(x, y, w, h, pixels, stride)) return 0;
   }
   return 1;
 }
@@ -731,7 +886,7 @@ bool lcd_init() {
     .cs_gpio_num = PIN_LCD_CS,
     .dc_gpio_num = PIN_LCD_DC,
     .spi_mode = 3,
-    .pclk_hz = 40 * 1000 * 1000,
+    .pclk_hz = LCD_PCLK_HZ,
     .trans_queue_depth = 10,
     .on_color_trans_done = NULL,
     .user_ctx = NULL,
@@ -779,13 +934,16 @@ void setup() {
     while (1) delay(100);
   }
 
-  jpegBuf = (uint8_t*)ps_malloc(JPEG_BUFFER_SIZE);
-  if (jpegBuf == NULL) {
-    Serial.println("Error: Failed to allocate JPEG buffer in PSRAM!");
+  jpegBufA = (uint8_t*)ps_malloc(JPEG_BUFFER_SIZE);
+  jpegBufB = (uint8_t*)ps_malloc(JPEG_BUFFER_SIZE);
+  if (jpegBufA == NULL || jpegBufB == NULL) {
+    Serial.println("Error: Failed to allocate JPEG ping-pong buffers in PSRAM!");
     Serial.printf("[BOOT] PSRAM size: %u KB\n", ESP.getPsramSize() / 1024);
     while (1) delay(100);
   }
-  Serial.printf("[BOOT] PSRAM OK: %u KB total, jpeg buffer %u KB\n",
+  scanBuf = jpegBufA;
+  drawBuf = NULL;
+  Serial.printf("[BOOT] PSRAM OK: %u KB total, ping-pong jpeg buffers 2 x %u KB\n",
                 ESP.getPsramSize() / 1024, JPEG_BUFFER_SIZE / 1024);
 
   if (!lcd_init()) {
