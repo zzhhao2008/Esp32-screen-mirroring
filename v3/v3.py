@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import websockets
 import mss
@@ -5,7 +6,6 @@ from PIL import Image
 import io
 from pynput.mouse import Button, Controller
 
-ESP32_IP = "192.168.1.43" # Change your Esp32 IP Adress
 ESP32_PORT = 81
 MONITOR_NUMBER = 1
 
@@ -106,7 +106,12 @@ async def send_screen(websocket):
         raise
 
 async def main():
-    uri = f"ws://{ESP32_IP}:{ESP32_PORT}"
+    parser = argparse.ArgumentParser(description="ESP32 screen mirroring client")
+    parser.add_argument("ip", help="ESP32 的 IP 地址，例如 192.168.1.43")
+    parser.add_argument("--port", type=int, default=ESP32_PORT, help=f"ESP32 WebSocket 端口（默认 {ESP32_PORT}）")
+    args = parser.parse_args()
+
+    uri = f"ws://{args.ip}:{args.port}"
     while True:
         try:
             print(f"Connecting to ESP32: {uri}")
